@@ -138,7 +138,7 @@ impl org_example_ping::VarlinkInterface for MyOrgExamplePing {
         call.reply()
     }
 
-    fn call_upgraded(&self, call: &mut Call, bufreader: &mut BufRead) -> varlink::Result<usize> {
+    fn call_upgraded(&self, call: &mut Call, bufreader: &mut BufRead) -> varlink::Result<Vec<u8>> {
         let mut buf = String::new();
         let len = bufreader.read_line(&mut buf)?;
         if len == 0 {
@@ -146,7 +146,7 @@ impl org_example_ping::VarlinkInterface for MyOrgExamplePing {
             // for now just drop out of upgraded
             call.set_upgraded(false);
 
-            return Ok(len);
+            return Ok(buf.as_bytes().to_vec());
             //return Err(varlink::ErrorKind::ConnectionClosed.into());
         }
         eprintln!("Server: upgraded got: {}", buf);
@@ -154,7 +154,33 @@ impl org_example_ping::VarlinkInterface for MyOrgExamplePing {
         call.writer.write_all("server reply\n".as_bytes())?;
 
         call.set_upgraded(true);
-        Ok(len)
+        Ok(Vec::new())
+    }
+}
+
+struct FdTracker {
+    stream: Option<ServerStream>,
+    buffer: Option<Vec<u8>>,
+}
+
+impl FdTracker {
+    fn shutdown(&mut self) -> varlink::Result<()> {
+        self.stream.as_mut().unwrap().shutdown()
+    }
+    fn chain_buffer(&mut self, buf: &mut Vec<u8>) {
+        self.buffer.as_mut().unwrap().append(buf);
+    }
+    fn fill_buffer(&mut self, buf: &Vec<u8>) {
+        self.buffer.as_mut().unwrap().clone_from(buf);
+    }
+    fn buf_as_slice(&mut self) -> &[u8] {
+        self.buffer.as_mut().unwrap().as_slice()
+    }
+    fn write(&mut self, out: &[u8]) -> ::std::io::Result<usize> {
+        self.stream.as_mut().unwrap().write(out.as_ref())
+    }
+    fn read(&mut self, buf: &mut [u8]) -> ::std::io::Result<usize> {
+        self.stream.as_mut().unwrap().read(buf)
     }
 }
 
@@ -164,8 +190,7 @@ pub fn listen_multiplex<S: ?Sized + AsRef<str>, H: ::ConnectionHandler + Send + 
     accept_timeout: u64,
 ) -> varlink::Result<()> {
     let handler = Arc::new(handler);
-    let mut fd_to_stream: HashMap<i32, ServerStream> = HashMap::new();
-    let mut fd_to_buffer: HashMap<i32, Vec<u8>> = HashMap::new();
+    let mut fdmap: HashMap<i32, FdTracker> = HashMap::new();
     let mut fds = Vec::new();
     let mut threads = Vec::new();
     let listener = Listener::new(address)?;
@@ -191,8 +216,13 @@ pub fn listen_multiplex<S: ?Sized + AsRef<str>, H: ::ConnectionHandler + Send + 
                 events: libc::POLLIN,
             });
 
-            fd_to_stream.insert(fd, client);
-            fd_to_buffer.insert(fd, Vec::new());
+            fdmap.insert(
+                fd,
+                FdTracker {
+                    stream: Some(client),
+                    buffer: Some(Vec::new()),
+                },
+            );
         }
 
         // Store which indices to remove
@@ -202,73 +232,47 @@ pub fn listen_multiplex<S: ?Sized + AsRef<str>, H: ::ConnectionHandler + Send + 
         for i in 1..fds.len() {
             if fds[i].revents != 0 {
                 let mut upgraded_iface: Option<String> = None;
-                let mut client = fd_to_stream.get_mut(&fds[i].fd).unwrap();
-                let mut buf = fd_to_buffer.get_mut(&fds[i].fd).unwrap();
+                let mut tracker = fdmap.get_mut(&fds[i].fd).unwrap();
                 loop {
-                    let mut msg_index: Option<usize> = None;
-                    let mut byte_buf: [u8; 8192] = [0; 8192];
-                    match client.read(&mut byte_buf) {
+                    let mut readbuf: [u8; 8192] = [0; 8192];
+
+                    match tracker.read(&mut readbuf) {
                         Ok(0) => {
-                            let _ = client.shutdown();
+                            let _ = tracker.shutdown();
                             indices_to_remove.push(i);
                             break;
                         }
                         Ok(len) => {
-                            // read() until zero byte
-                            let old: usize = buf.len();
-                            buf.extend(&byte_buf[0..len]);
+                            let mut out: Vec<u8> = Vec::new();
+                            tracker.chain_buffer(&mut readbuf[0..len].to_vec());
 
-                            for (n, b) in byte_buf[0..len].iter().enumerate() {
-                                if *b == 0u8 {
-                                    msg_index = Some(old + n + 1);
-                                    break;
-                                }
-                            }
+                            match handler.handle(&mut tracker.buf_as_slice(), &mut out, None) {
+                                // TODO: buffer output and write only on POLLOUT
+                                Ok((remaining_bytes, last_iface)) => {
+                                    upgraded_iface = last_iface;
+                                    tracker.fill_buffer(&remaining_bytes);
 
-                            // if zero byte found, handle message and write output.
-                            if let Some(n) = msg_index {
-                                let mut out: Vec<u8> = Vec::new();
-                                match handler.handle(
-                                    &mut BufReader::new(&buf[0..n]),
-                                    &mut out,
-                                    None,
-                                ) {
-                                    // TODO: buffer output and write only on POLLOUT
-                                    Ok(None) => match client.write(out.as_ref()) {
+                                    match tracker.write(out.as_ref()) {
                                         Err(e) => {
                                             eprintln!("write error: {}", e);
-                                            let _ = client.shutdown();
+                                            let _ = tracker.shutdown();
                                             indices_to_remove.push(i);
                                             break;
                                         }
                                         Ok(_) => {}
-                                    },
-                                    Ok(Some(last_iface)) => match client.write(out.as_ref()) {
-                                        Err(e) => {
-                                            eprintln!("write error: {}", e);
-                                            let _ = client.shutdown();
-                                            indices_to_remove.push(i);
-                                            break;
-                                        }
-                                        Ok(_) => {
-                                            upgraded_iface = Some(last_iface);
-                                        }
-                                    },
-                                    Err(e) => match e.kind() {
-                                        err => {
-                                            eprintln!("handler error: {}", err);
-                                            for cause in err.causes().skip(1) {
-                                                eprintln!("  caused by: {}", cause);
-                                            }
-                                            let _ = client.shutdown();
-                                            indices_to_remove.push(i);
-                                            break;
-                                        }
-                                    },
+                                    }
                                 }
-
-                                // Remove the handled message
-                                buf.drain(0..n);
+                                Err(e) => match e.kind() {
+                                    err => {
+                                        eprintln!("handler error: {}", err);
+                                        for cause in err.causes().skip(1) {
+                                            eprintln!("  caused by: {}", cause);
+                                        }
+                                        let _ = tracker.shutdown();
+                                        indices_to_remove.push(i);
+                                        break;
+                                    }
+                                },
                             }
                         }
                         Err(e) => match e.kind() {
@@ -276,7 +280,7 @@ pub fn listen_multiplex<S: ?Sized + AsRef<str>, H: ::ConnectionHandler + Send + 
                                 break;
                             }
                             _ => {
-                                let _ = client.shutdown();
+                                let _ = tracker.shutdown();
                                 indices_to_remove.push(i);
                                 eprintln!("IO error: {}", e);
                                 break;
@@ -288,20 +292,20 @@ pub fn listen_multiplex<S: ?Sized + AsRef<str>, H: ::ConnectionHandler + Send + 
                     eprintln!("Upgraded MODE");
                     // upgraded mode... thread away the server
                     // feed it directly with the client stream
+                    // If you have a better idea, open an Issue or PR on github
                     indices_to_remove.push(i);
-                    let mut stream = client.try_clone().unwrap();
+
                     let j = thread::spawn({
                         eprintln!("upgraded thread");
                         let handler = handler.clone();
+                        let mut stream = tracker.stream.take().unwrap();
+                        let mut bufreader = tracker.buffer.take().unwrap();
                         move || {
                             let _r = stream.set_nonblocking(false);
                             let (reader, mut writer) = stream.split().unwrap();
-
-                            let _r = handler.handle(
-                                &mut BufReader::new(reader),
-                                &mut writer,
-                                upgraded_iface,
-                            );
+                            let br = BufReader::new(reader);
+                            let mut bufreader = Box::new(bufreader.chain(br));
+                            let _r = handler.handle(&mut bufreader, &mut writer, upgraded_iface);
                         }
                     });
                     threads.push(j);
@@ -311,8 +315,7 @@ pub fn listen_multiplex<S: ?Sized + AsRef<str>, H: ::ConnectionHandler + Send + 
 
         // We can't modify the vector while we are traversing it, so update now.
         for i in indices_to_remove {
-            fd_to_buffer.remove(&fds[i].fd);
-            fd_to_stream.remove(&fds[i].fd);
+            fdmap.remove(&fds[i].fd);
             fds.remove(i);
         }
 
