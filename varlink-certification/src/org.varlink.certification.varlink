@@ -1,4 +1,4 @@
-# Interface to test varlink implementations against.
+## Interface to test varlink implementations against.
 # First you write a varlink client calling:
 # Start, Test01, Test02, …, Test09, End
 # The return value of the previous call should be the argument of the next call.
